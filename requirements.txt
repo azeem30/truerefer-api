@@ -6,4 +6,3 @@ cryptography
 pyjwt
 dropbox
 werkzeug
-smtplib
