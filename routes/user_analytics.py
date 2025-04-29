@@ -1,6 +1,5 @@
 from flask import jsonify, g, request
 from db_utils import get_db_connection
-import uuid
 
 def register_user_analytics_routes(app, db_pool):
     @app.route("/analytics/profile-completeness", methods=["GET"])
