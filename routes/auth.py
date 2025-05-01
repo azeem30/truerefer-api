@@ -30,7 +30,7 @@ def register_auth_routes(app, db_pool):
             phone = data["contact"]
             user_type = data["role"]
             password = data["password"]
-            if user_type not in ["student", "referrer", "admin"]:
+            if user_type not in ["student", "referrer", "moderator"]:
                 return jsonify({"error": "Invalid type"}), 400
             with get_db_connection(db_pool) as connection:
                 with connection.cursor() as cursor: 
