@@ -35,3 +35,11 @@ DB_CONFIG = {
     'password': os.getenv('DB_PASSWORD', 'Azeem@123'),
     'database': os.getenv('DB_NAME', 'truerefer')
 }
+
+REDIS_CONFIG = {
+    'host': os.getenv('REDIS_HOST'),
+    'port': int(os.getenv('REDIS_PORT')),
+    'username': os.getenv('REDIS_USER'),
+    'password': os.getenv('REDIS_PASSWORD'),
+    'decode_responses': True
+}

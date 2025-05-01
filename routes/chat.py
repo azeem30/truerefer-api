@@ -2,8 +2,59 @@ from flask import jsonify, request, url_for
 from db_utils import get_db_connection
 from dropbox_utils import upload_attachment_to_dropbox
 from dropbox.exceptions import AuthError, ApiError
+import redis
+import json
+import uuid
+from datetime import datetime
 
-def register_chat_routes(app, db_pool):
+def register_chat_routes(app, db_pool, redis_pool):
+    SESSION_TTL = 1800
+
+    def get_session_key(user_id1, user_id2):
+        """Generate a consistent session key for two users"""
+        sorted_ids = sorted([int(user_id1), int(user_id2)])
+        return f"chat_session:{sorted_ids[0]}:{sorted_ids[1]}"
+
+    def flush_messages_to_db(session_key, connection):
+        """Flush cached messages from Redis to MySQL"""
+        try:
+            r = redis.Redis(connection_pool=redis_pool)
+            messages = r.lrange(session_key, 0, -1)
+            if not messages:
+                return
+            app.logger.info(f"Flushing {len(messages)} messages to DB for session: {session_key}")
+            
+            with connection.cursor() as cursor:
+                for msg in messages:
+                    try:
+                        # Handle both bytes and string messages
+                        if isinstance(msg, bytes):
+                            msg_data = json.loads(msg.decode('utf-8'))
+                        else:
+                            msg_data = json.loads(msg)
+                            
+                        cursor.execute(
+                            """INSERT INTO messages 
+                            (sender_id, receiver_id, message, attachment_url, timestamp) 
+                            VALUES (%s, %s, %s, %s, %s)""",
+                            (
+                                msg_data['sender_id'],
+                                msg_data['receiver_id'],
+                                msg_data['message'],
+                                msg_data.get('attachment_url'),
+                                msg_data['timestamp']
+                            )
+                        )
+                    except json.JSONDecodeError as e:
+                        app.logger.error(f"Failed to decode message: {msg}. Error: {str(e)}")
+                        continue
+                connection.commit()
+            r.delete(session_key)
+        except Exception as e:
+            app.logger.error(f"Error flushing messages to DB: {str(e)}")
+            connection.rollback()
+            raise
+
     @app.route("/chat_list", methods=["GET"])
     def chat_list():
         """Get list of all distinct users the current user has chatted with, along with latest message"""
@@ -83,14 +134,57 @@ def register_chat_routes(app, db_pool):
 
     @app.route("/messages", methods=["GET"])
     def get_messages():
-        """Get all messages between two users"""
+        """Get all messages between two users, including cached messages from Redis"""
         try:
             sender_id = request.args.get('sender_id')
             receiver_id = request.args.get('receiver_id')
             if not sender_id or not receiver_id:
                 return jsonify({"error": "Both sender_id and receiver_id are required"}), 400
+                
+            session_key = get_session_key(sender_id, receiver_id)
+            r = redis.Redis(connection_pool=redis_pool)
+            
+            # Get cached messages from Redis
+            cached_messages = []
+            try:
+                raw_messages = r.lrange(session_key, 0, -1)
+                for msg in raw_messages:
+                    try:
+                        if isinstance(msg, bytes):
+                            msg_data = json.loads(msg.decode('utf-8'))
+                        else:
+                            msg_data = json.loads(msg)
+                            
+                        cached_messages.append({
+                            'id': None,  # Indicates it's a cached message
+                            'sender_id': msg_data['sender_id'],
+                            'receiver_id': msg_data['receiver_id'],
+                            'message': msg_data['message'],
+                            'timestamp': msg_data['timestamp'],
+                            'attachment_url': msg_data.get('attachment_url'),
+                            'sender': {
+                                'first_name': None,  # Will be filled from DB
+                                'middle_name': None,
+                                'last_name': None,
+                                'profile_picture': None
+                            },
+                            'receiver': {
+                                'first_name': None,
+                                'middle_name': None,
+                                'last_name': None,
+                                'profile_picture': None
+                            }
+                        })
+                    except (json.JSONDecodeError, KeyError) as e:
+                        app.logger.error(f"Invalid message format in Redis: {msg}. Error: {str(e)}")
+                        continue
+            except redis.RedisError as e:
+                app.logger.error(f"Redis error: {str(e)}")
+                # Continue with DB fetch even if Redis fails
+
             with get_db_connection(db_pool) as connection:
                 with connection.cursor() as cursor:
+                    # Get messages from database
                     query = """
                     SELECT 
                         m.id,
@@ -115,16 +209,17 @@ def register_chat_routes(app, db_pool):
                     ORDER BY m.timestamp ASC
                     """
                     cursor.execute(query, (sender_id, receiver_id, receiver_id, sender_id))
-                    messages = cursor.fetchall()
+                    db_messages = cursor.fetchall()
+                    
                     formatted_messages = []
-                    for msg in messages:
-                        formatted_message = {
+                    for msg in db_messages:
+                        formatted_messages.append({
                             'id': msg['id'],
                             'sender_id': msg['sender_id'],
                             'receiver_id': msg['receiver_id'],
                             'message': msg['message'],
                             'timestamp': msg['timestamp'].isoformat() if msg['timestamp'] else None,
-                            'attachment_url': msg['attachment_url'] if 'attachment_url' in msg and msg['attachment_url'] else None,
+                            'attachment_url': msg['attachment_url'],
                             'sender': {
                                 'first_name': msg['sender_first_name'],
                                 'middle_name': msg['sender_middle_name'],
@@ -137,17 +232,20 @@ def register_chat_routes(app, db_pool):
                                 'last_name': msg['receiver_last_name'],
                                 'profile_picture': msg['receiver_profile_picture'] or url_for('static', filename='default_profile.png', _external=True)
                             }
-                        }
-                        formatted_message = {k: v for k, v in formatted_message.items() if v is not None}
-                        formatted_messages.append(formatted_message)
-                    return jsonify(formatted_messages), 200
+                        })
+                    
+                    # Combine and sort all messages
+                    all_messages = formatted_messages + cached_messages
+                    all_messages.sort(key=lambda x: x['timestamp'])
+                    
+                    return jsonify(all_messages), 200
         except Exception as e:
-            app.logger.error(f"Error fetching messages: {str(e)}")
+            app.logger.error(f"Error fetching messages: {str(e)}", exc_info=True)
             return jsonify({'error': 'An error occurred while fetching messages'}), 500
 
     @app.route("/send_messages", methods=["POST"])
     def send_message():
-        """Send a message between two users with optional attachment"""
+        """Send a message between two users with optional attachment, cache in Redis"""
         try:
             attachment_url = None
             if 'attachment' in request.files:
@@ -167,27 +265,46 @@ def register_chat_routes(app, db_pool):
             message = request.form.get('message', '') or request.json.get('message', '')
             if not all([sender_id, receiver_id]):
                 return jsonify({"error": "Missing required fields"}), 400
-            with get_db_connection(db_pool) as connection:
-                with connection.cursor() as cursor:
-                    if attachment_url:
-                        cursor.execute(
-                            """INSERT INTO messages 
-                            (sender_id, receiver_id, message, attachment_url) 
-                            VALUES (%s, %s, %s, %s)""",
-                            (sender_id, receiver_id, message, attachment_url)
-                        )
-                    else:
-                        cursor.execute(
-                            """INSERT INTO messages 
-                            (sender_id, receiver_id, message) 
-                            VALUES (%s, %s, %s)""",
-                            (sender_id, receiver_id, message)
-                        )
-                    connection.commit()
-                    return jsonify({
-                        "message": message,
-                        "attachment_url": attachment_url
-                    }), 201
+            session_key = get_session_key(sender_id, receiver_id)
+            print(f"[SESSION STARTED] sender_id: {sender_id}, receiver_id: {receiver_id}, session_key: {session_key}")
+            r = redis.Redis(connection_pool=redis_pool)
+            message_data = {
+                'sender_id': sender_id,
+                'receiver_id': receiver_id,
+                'message': message,
+                'timestamp': datetime.utcnow().isoformat(),
+            }
+            if attachment_url:
+                message_data['attachment_url'] = attachment_url
+            r.rpush(session_key, json.dumps(message_data))
+            r.expire(session_key, SESSION_TTL)  # Refresh TTL
+            return jsonify({
+                "message": message,
+                "sender_id": sender_id,
+                "receiver_id": receiver_id,
+                "attachment_url": attachment_url
+            }), 201
         except Exception as e:
             app.logger.error(f"Error sending message: {str(e)}")
+            return jsonify({"error": "Internal server error"}), 500
+
+    @app.route("/end_chat_session", methods=["POST"])
+    def end_chat_session():
+        """End a chat session and flush cached messages to MySQL"""
+        try:
+            data = request.get_json()
+            sender_id = data.get('sender_id')
+            receiver_id = data.get('receiver_id')
+            
+            if not sender_id or not receiver_id:
+                return jsonify({"error": "Both sender_id and receiver_id are required"}), 400
+
+            session_key = get_session_key(sender_id, receiver_id)
+            app.logger.info(f"Ending chat session: {session_key}")
+            
+            with get_db_connection(db_pool) as connection:
+                flush_messages_to_db(session_key, connection)
+                return jsonify({"message": "Chat session ended and messages saved"}), 200
+        except Exception as e:
+            app.logger.error(f"Error ending chat session: {str(e)}", exc_info=True)
             return jsonify({"error": "Internal server error"}), 500
